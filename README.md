@@ -1,2 +1,0 @@
-# RICHMAN
-Just mini app)
