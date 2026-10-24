@@ -1,0 +1,2 @@
+# RICHMAN
+Just mini app)
