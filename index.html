@@ -179,6 +179,18 @@ nav button.on{color:var(--gold)}nav button.on span{filter:none}
 .rctl .pbtn{min-height:42px}
 .rctl .acts{display:grid;grid-template-columns:48px 48px 48px 1fr;gap:8px}
 .rctl .acts .btn{min-height:46px;font-size:16px}
+
+/* уведомление о банкротстве */
+#bk{position:fixed;inset:0;background:rgba(0,0,0,.78);display:none;align-items:center;justify-content:center;z-index:50;padding:20px}
+#bk.show{display:flex}
+#bk .box{width:100%;max-width:360px;text-align:center;padding:24px 20px 20px;border-radius:22px;border:1px solid var(--gold2);
+  background:linear-gradient(160deg,var(--card),var(--bg2));box-shadow:0 0 40px rgba(245,197,66,.25);animation:bkIn .3s ease}
+#bk .ico{font-size:54px;line-height:1;margin-bottom:6px}
+#bk h3{margin:6px 0 8px;font-size:23px;letter-spacing:.5px;color:var(--goldsoft)}
+#bk .sub{margin:0 0 10px}
+#bk .amt{display:flex;align-items:center;justify-content:center;gap:12px;font-size:34px;font-weight:900;color:var(--goldsoft);margin:12px 0;text-shadow:0 0 18px rgba(245,197,66,.4)}
+#bk .tmr{font-size:34px;font-weight:900;color:var(--goldsoft);font-variant-numeric:tabular-nums;margin:12px 0 16px}
+@keyframes bkIn{from{opacity:0;transform:scale(.92)}to{opacity:1;transform:none}}
 </style>
 </head>
 <body>
@@ -186,6 +198,7 @@ nav button.on{color:var(--gold)}nav button.on span{filter:none}
 <nav><div class="in" id="nav"></div></nav>
 <div id="toast"></div>
 <div id="modal"><div class="box" id="modalBox"></div></div>
+<div id="bk"><div class="box" id="bkBox"></div></div>
 
 <script>
 "use strict";
@@ -208,7 +221,9 @@ const CONFIG = {
   dailyCooldownMs: 24 * 60 * 60 * 1000,
   dailyStreakResetMs: 48 * 60 * 60 * 1000,
   dailyBase: 100, dailyStep: 50, dailyMaxStreak: 7,
-  maxBalance: 1e12
+  maxBalance: 1e12,
+  rescueAmount: 1000,                     // RC, которые выдаются при банкротстве
+  rescueCooldownMs: 24 * 60 * 60 * 1000   // не чаще одного раза в 24 часа
 };
 const GAMES = [
   {id:"roulette", name:"Европейская рулетка", icon:"🎡", desc:"Числа 0–36: цвет, чёт/нечет, диапазоны, числа", status:"live"},
@@ -261,7 +276,7 @@ function defaultState(){
   return {
     v:1, name, balance:CONFIG.startBalance, level:1, xp:0, createdAt:Date.now(),
     stats:{rounds:0, wins:0, biggestWin:0, wagered:0},
-    lastDaily:0, streak:0, lastBet:10, pending:null,
+    lastDaily:0, lastRescue:0, streak:0, lastBet:10, pending:null,
     history:{slots:[],crash:[],roulette:[]},
     quests:{day:todayKey(), progress:{}, claimed:{}},
     owned:["av_hat","fr_gold"], equipped:{avatar:"av_hat", frame:"fr_gold"},
@@ -318,6 +333,8 @@ function sanitize(raw){
   if(!isInt(s.xp,0)) s.xp=0;
   if(!isInt(s.streak,0)) s.streak=0;
   if(!isInt(s.lastDaily,0) || s.lastDaily>Date.now()) s.lastDaily = s.lastDaily>Date.now()? Date.now() : 0;
+  if(!isInt(s.lastRescue,0)) s.lastRescue = 0;
+  if(s.lastRescue > Date.now()) s.lastRescue = Date.now();   // часы переведены назад — отсчёт заново
   if(typeof s.name!=="string" || !s.name.trim()) s.name=d.name;
   s.name = s.name.slice(0,16);
   return s;
@@ -330,7 +347,7 @@ const Economy = {
   /* списать фишки (покупка и т.п.). Возвращает true только если списание прошло */
   spend(n){
     if(!isInt(n,1) || S.balance < n) return false;
-    S.balance -= n; S.stats.wagered += n; save(); return true;
+    S.balance -= n; S.stats.wagered += n; save(); Bankruptcy.soon(); return true;
   },
   /* начислить фишки (награды) */
   earn(n){
@@ -357,6 +374,7 @@ const Economy = {
     if(h.length > 20) h.length = 20;
     this.roundDone(payout > p.bet, payout);      // статистика, задания, опыт, save()
     ui.pulse = payout > 0; refreshTop();
+    Bankruptcy.soon();      // проверка банкротства — уже после расчёта и с небольшой паузой
     return {bet:p.bet, payout};
   },
   roundDone(won, payout){
@@ -422,6 +440,72 @@ const Shop = {
   equip(id){
     const it = this.item(id); if(!it || !S.owned.includes(id)) return false;
     S.equipped[it.type] = id; save(); return true;
+  }
+};
+
+/* ---------- 4б. Защита от банкротства ----------
+   ЕДИНСТВЕННОЕ место, где решается, выдавать ли RC при нулевом балансе.
+   Все игры и магазин используют его через Economy (settle / spend), поэтому
+   логика не дублируется. Вызывается: после рассчитанного раунда и покупки (soon),
+   при запуске и раз в секунду (start/tick), при попытке ставки с нулевым балансом.
+   Время восстановления лежит в S.lastRescue и сохраняется тем же save(), что и баланс. */
+const Bankruptcy = {
+  hold:0,          // до этого момента не проверяем: игрок должен увидеть итог раунда
+  noticed:false,   // уведомление «ждите» уже показано в текущем банкротстве
+  shown:null,      // что открыто в окне: "grant" | "wait" | null
+  left(){          // сколько мс осталось до следующего восстановления
+    return Math.max(0, Math.min(CONFIG.rescueCooldownMs, S.lastRescue + CONFIG.rescueCooldownMs - Date.now()));
+  },
+  soon(){ this.hold = Date.now() + 700; setTimeout(()=>this.check(), 750); },
+  check(force){
+    if(S.pending) return false;                       // раунд ещё не рассчитан — рано
+    if(S.balance < 0) S.balance = 0;                  // уйти в минус нельзя
+    if(S.balance > 0){ this.noticed = false; if(this.shown==="wait") this.close(); return false; }
+    if(!force && Date.now() < this.hold) return false;
+    const now = Date.now();
+    if(S.lastRescue > now) S.lastRescue = now;
+    this.syncStored();
+    if(S.lastRescue === 0 || now - S.lastRescue >= CONFIG.rescueCooldownMs) return this.grant(now);
+    if(force || !this.noticed){ this.noticed = true; this.show("wait"); Sound.error(); haptic("error"); }
+    return false;
+  },
+  /* другое окно приложения могло уже выдать восстановление — не дублируем */
+  syncStored(){
+    const st = Storage.load();
+    if(st && isInt(st.lastRescue,0) && st.lastRescue > S.lastRescue && st.lastRescue <= Date.now()) S.lastRescue = st.lastRescue;
+  },
+  grant(now){
+    S.lastRescue = now;                               // 1) фиксируем время
+    Economy.earn(CONFIG.rescueAmount);                // 2) начисляем; один save() пишет и баланс, и время
+    this.noticed = false;
+    if(ui.view !== "game") render(); else refreshTop();   // не трогаем экран игры
+    this.show("grant"); Sound.win(); haptic();
+    return true;
+  },
+  show(kind){
+    const bk = $("#bk"), box = $("#bkBox"); if(!bk || !box) return;
+    const amt = fmt(CONFIG.rescueAmount);
+    box.innerHTML = kind==="grant"
+      ? `<div class="ico">💸</div><h3>БАНКРОТСТВО!</h3>
+         <p class="sub">Вам начислено ${amt} RC для продолжения игры</p>
+         <div class="amt"><i class="chip lg"></i>+${amt}</div>
+         <p class="sub" style="font-size:13px">Автоматическое восстановление доступно один раз в 24 часа</p>
+         <button class="btn" data-action="bkClose">Продолжить игру</button>`
+      : `<div class="ico">⏳</div><h3>БАНКРОТСТВО</h3>
+         <p class="sub">Монеты закончились, а автоматическое восстановление уже использовано. Следующие ${amt} RC — через</p>
+         <div class="tmr" id="bkTmr">${fmtTime(this.left())}</div>
+         <button class="btn sec" data-action="bkClose">Понятно</button>`;
+    this.shown = kind; bk.classList.add("show");
+  },
+  close(){ const bk = $("#bk"); if(bk) bk.classList.remove("show"); this.shown = null; },
+  tick(){
+    if(this.shown==="wait"){ const t = $("#bkTmr"); if(t) t.textContent = fmtTime(this.left()); }
+    this.check();
+  },
+  start(){
+    const bk = $("#bk"); if(bk) bk.addEventListener("click", e=>{ if(e.target === bk) this.close(); });
+    this.check();
+    setInterval(()=>this.tick(), 1000);
   }
 };
 
@@ -612,6 +696,7 @@ function render(){
 
 const Actions = {
   nav(a){ go(a); },
+  bkClose(){ Bankruptcy.close(); },
   bet(a){ Bet.act(a); },
   slotSpin(){ SlotsView.spin(); },
   crashBtn(){ CrashView.press(); },
@@ -699,6 +784,7 @@ const Bet = {
   },
   get(){ const el = $("#betInput"); const v = parseInt(el ? el.value : S.lastBet, 10); return isInt(v,1) ? v : 0; },
   validate(){            // возвращает ставку или 0 (с сообщением об ошибке)
+    if(S.balance <= 0){ Bankruptcy.check(true); return 0; }
     const v = this.get();
     if(!v){ toast("Введите ставку"); Sound.error(); haptic("error"); return 0; }
     if(v > S.balance){ toast("Не хватает RC"); Sound.error(); haptic("error"); return 0; }
@@ -1031,6 +1117,7 @@ const RouletteView = {
   chip(v){ if(this.V.busy) return; v = parseInt(v,10); if(this.CHIPS.includes(v)){ this.V.chip = v; this.refresh(); } },
   place(key){
     const V = this.V; if(V.busy || S.pending || !ROU.valid(key)) return;
+    if(S.balance <= 0){ Bankruptcy.check(true); return; }
     if(this.total() + V.chip > S.balance){ toast("Не хватает RC"); Sound.error(); haptic("error"); return; }
     V.bets[key] = (V.bets[key]||0) + V.chip; V.stack.push({key, add:V.chip}); this.refresh();
   },
@@ -1130,6 +1217,7 @@ try{
 save();
 resolvePendingOnLoad();
 render();
+Bankruptcy.start();
 document.addEventListener("pointerdown", ()=>Sound.syncMusic(), {once:true});
 </script>
 </body>
